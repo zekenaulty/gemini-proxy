@@ -165,3 +165,6 @@ dist
 .env*
 !.env.example
 .wrangler/
+
+# Operator-specific account/store references; never include credential values.
+/wrangler.operator.jsonc
