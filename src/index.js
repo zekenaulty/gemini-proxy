@@ -145,6 +145,39 @@ async function checkLimits(request, env) {
 	}
 }
 
+function hasOpenAIKey(binding) {
+	return (typeof binding === 'string' && Boolean(binding.trim())) ||
+		(binding !== null && typeof binding === 'object' && typeof binding.get === 'function');
+}
+
+async function openAIKey(binding, signal) {
+	if (signal.aborted) throw unavailable();
+	let key = binding;
+	if (typeof binding !== 'string') {
+		// Secrets Store is an async binding, not a Worker string secret. Keep the
+		// lookup inside the request deadline; do not cache keys across requests.
+		let abort;
+		const aborted = new Promise((_, reject) => {
+			abort = () => reject(unavailable());
+			signal.addEventListener('abort', abort, { once: true });
+		});
+		try {
+			key = await Promise.race([Promise.resolve().then(() => {
+				if (signal.aborted) throw unavailable();
+				return binding.get();
+			}), aborted]);
+		} catch {
+			throw unavailable();
+		} finally {
+			signal.removeEventListener('abort', abort);
+		}
+	}
+	// Never stringify a binding/error object or propagate malformed secret values
+	// into a header. All failures use the same public-safe configuration error.
+	if (signal.aborted || typeof key !== 'string' || !/^[\x21-\x7e]{1,4096}$/.test(key)) throw unavailable();
+	return key;
+}
+
 async function askOpenAI(messages, env, config, request) {
 	const controller = new AbortController();
 	let timedOut = false;
@@ -156,11 +189,12 @@ async function askOpenAI(messages, env, config, request) {
 	request.signal.addEventListener('abort', abort, { once: true });
 	if (request.signal.aborted) abort();
 	try {
+		const apiKey = await openAIKey(env.OPENAI_API_KEY, controller.signal);
 		const response = await fetch(OPENAI_URL, {
 			method: 'POST',
 			redirect: 'error',
 			signal: controller.signal,
-			headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + env.OPENAI_API_KEY },
+			headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + apiKey },
 			body: JSON.stringify({
 				model: 'gpt-6.1-sol',
 				reasoning: { effort: 'high' },
@@ -222,7 +256,7 @@ export default {
 			}
 			if (request.method !== 'POST') throw new PublicError(405, 'method_not_allowed', 'Send a POST request to chat.');
 			if (env.PUBLIC_CHAT_ENABLED !== 'true') throw new PublicError(503, 'chat_disabled', 'Chat is not available right now. You can still browse the résumé pages.');
-			if (typeof env.OPENAI_API_KEY !== 'string' || !env.OPENAI_API_KEY.trim() ||
+			if (!hasOpenAIKey(env.OPENAI_API_KEY) ||
 				typeof env.PUBLIC_RESUME_CONTEXT !== 'string' || !env.PUBLIC_RESUME_CONTEXT.trim() || new TextEncoder().encode(env.PUBLIC_RESUME_CONTEXT).byteLength > MAX_CONTEXT_BYTES ||
 				typeof env.CHAT_CLIENT_LIMITER?.limit !== 'function' || typeof env.CHAT_AGGREGATE_LIMITER?.limit !== 'function') throw unavailable();
 			const config = {

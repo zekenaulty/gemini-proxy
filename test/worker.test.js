@@ -160,3 +160,156 @@ test('upstream deadline cancels a stalled response body and performs no retry', 
 	assert.equal(cancelled, true);
 	assert.equal(fetch.mock.callCount(), 1);
 });
+
+test('Secrets Store get() supplies a request-scoped key only to the upstream header and permits rotation', async (t) => {
+	const keys = ['fixture-store-key-one', 'fixture-store-key-two'];
+	let reads = 0;
+	const binding = { async get() { assert.equal(this, binding); return keys[reads++]; } };
+	const headers = [];
+	mockFetch(t, async (_url, options) => {
+		headers.push(options.headers.Authorization);
+		assert.doesNotMatch(options.body, /fixture-store-key/);
+		return upstream();
+	});
+	for (let i = 0; i < 2; i++) {
+		const response = await worker.fetch(request(), env({ OPENAI_API_KEY: binding }));
+		assert.equal(response.status, 200);
+		assert.doesNotMatch(await response.text(), /fixture-store-key/);
+	}
+	assert.equal(reads, 2);
+	assert.deepEqual(headers, keys.map((key) => 'Bearer ' + key));
+});
+
+test('all public validation and rate-limit gates run before any Secrets Store lookup', async (t) => {
+	const fetch = mockFetch(t);
+	let reads = 0;
+	const binding = { async get() { reads++; return 'fixture-store-key'; } };
+	for (const overrides of [
+		{ PUBLIC_CHAT_ENABLED: 'false' }, { PUBLIC_RESUME_CONTEXT: '' },
+		{ CHAT_CLIENT_LIMITER: undefined }, { CHAT_AGGREGATE_LIMITER: undefined },
+		{ CHAT_UPSTREAM_TIMEOUT_MS: '0' },
+		{ CHAT_CLIENT_LIMITER: { limit: async () => ({ success: false }) } },
+		{ CHAT_AGGREGATE_LIMITER: { limit: async () => ({ success: false }) } },
+	]) assert.notEqual((await worker.fetch(request(), env({ OPENAI_API_KEY: binding, ...overrides }))).status, 200);
+	for (const req of [
+		request({}, { Origin: 'https://evil.example' }), request({}, {}, '/'),
+		request({ messages, system_instruction: 'override' }), request({}, { 'Content-Type': 'text/plain' }),
+		request({}, { 'Content-Length': '32769' }),
+		request({}, { 'Access-Control-Request-Method': 'POST' }, '/chat', 'OPTIONS'),
+	]) await worker.fetch(req, env({ OPENAI_API_KEY: binding }));
+	assert.equal(reads, 0);
+	assert.equal(fetch.mock.callCount(), 0);
+});
+
+test('missing/malformed bindings and invalid secret values fail closed without headers or diagnostics', async (t) => {
+	const fetch = mockFetch(t);
+	const errors = t.mock.method(console, 'error', () => {});
+	const warnings = t.mock.method(console, 'warn', () => {});
+	const logs = t.mock.method(console, 'log', () => {});
+	for (const binding of [undefined, null, {}, { get: 'not a function' }, 12,
+		' ', 'fixture-key\nInjected', ' padded-key ', 'x'.repeat(4097),
+		...['', ' ', 'fixture-key\r\nInjected: value', ' padded-key ', 'x'.repeat(4097), undefined, null, {}, 42]
+			.map((value) => ({ async get() { return value; } })),
+		{ async get() { throw Error('fixture-private-store-detail'); } },
+		{ get() { throw Error('fixture-private-synchronous-detail'); } },
+	]) {
+		const response = await worker.fetch(request(), env({ OPENAI_API_KEY: binding }));
+		assert.equal(response.status, 503);
+		assert.deepEqual(await response.json(), { error: { code: 'chat_unavailable', message: 'Chat is temporarily unavailable. You can still browse the résumé pages.' } });
+	}
+	assert.equal(fetch.mock.callCount(), 0);
+	assert.equal(errors.mock.callCount() + warnings.mock.callCount() + logs.mock.callCount(), 0);
+});
+
+test('a stalled Secrets Store lookup shares the bounded upstream deadline and never calls OpenAI', async (t) => {
+	const fetch = mockFetch(t);
+	let reads = 0;
+	let finish;
+	const lookup = new Promise((resolve) => { finish = resolve; });
+	const response = await worker.fetch(request(), env({
+		OPENAI_API_KEY: { get() { reads++; return lookup; } }, CHAT_UPSTREAM_TIMEOUT_MS: '1000',
+	}));
+	assert.equal(response.status, 504);
+	assert.equal(reads, 1);
+	finish('fixture-late-key');
+	await new Promise((resolve) => setImmediate(resolve));
+	assert.equal(fetch.mock.callCount(), 0);
+});
+
+test('disconnect during secret lookup prevents late paid calls; an already aborted request does not read the key', async (t) => {
+	const fetch = mockFetch(t);
+	const controller = new AbortController();
+	let reads = 0;
+	let start;
+	let finish;
+	const started = new Promise((resolve) => { start = resolve; });
+	const lookup = new Promise((resolve) => { finish = resolve; });
+	const settings = env({ OPENAI_API_KEY: { get() { reads++; start(); return lookup; } } });
+	const pending = worker.fetch(new Request(request(), { signal: controller.signal }), settings);
+	await started;
+	controller.abort();
+	assert.equal((await pending).status, 503);
+	finish('fixture-late-key');
+	await new Promise((resolve) => setImmediate(resolve));
+	assert.equal((await worker.fetch(new Request(request(), { signal: controller.signal }), settings)).status, 503);
+	assert.equal(reads, 1);
+	assert.equal(fetch.mock.callCount(), 0);
+});
+
+test('late lookup rejection after timeout or disconnect is handled without a paid call', async (t) => {
+	t.mock.timers.enable({ apis: ['setTimeout'] });
+	const fetch = mockFetch(t);
+	const unhandled = [];
+	const onUnhandled = (error) => unhandled.push(error);
+	process.on('unhandledRejection', onUnhandled);
+	t.after(() => process.off('unhandledRejection', onUnhandled));
+	for (const mode of ['timeout', 'disconnect']) {
+		const controller = new AbortController();
+		let start;
+		let rejectLookup;
+		const started = new Promise((resolve) => { start = resolve; });
+		const lookup = new Promise((_, reject) => { rejectLookup = reject; });
+		const pending = worker.fetch(new Request(request(), { signal: controller.signal }), env({
+			OPENAI_API_KEY: { get() { start(); return lookup; } }, CHAT_UPSTREAM_TIMEOUT_MS: '1000',
+		}));
+		await started;
+		if (mode === 'timeout') t.mock.timers.tick(1000);
+		else controller.abort();
+		assert.equal((await pending).status, mode === 'timeout' ? 504 : 503);
+		rejectLookup(Error('fixture-private-late-error'));
+		await new Promise((resolve) => setImmediate(resolve));
+	}
+	assert.deepEqual(unhandled, []);
+	assert.equal(fetch.mock.callCount(), 0);
+});
+
+test('successful secret lookup and stalled provider share one total deadline', async (t) => {
+	t.mock.timers.enable({ apis: ['setTimeout'] });
+	let startLookup;
+	let finishLookup;
+	let startFetch;
+	const lookupStarted = new Promise((resolve) => { startLookup = resolve; });
+	const lookup = new Promise((resolve) => { finishLookup = resolve; });
+	const fetchStarted = new Promise((resolve) => { startFetch = resolve; });
+	let cancelled = false;
+	const fetch = mockFetch(t, async () => {
+		startFetch();
+		return new Response(new ReadableStream({ cancel() { cancelled = true; } }));
+	});
+	let settled = false;
+	const pending = worker.fetch(request(), env({
+		OPENAI_API_KEY: { get() { startLookup(); return lookup; } }, CHAT_UPSTREAM_TIMEOUT_MS: '1000',
+	})).then((response) => { settled = true; return response; });
+	await lookupStarted;
+	t.mock.timers.tick(400);
+	finishLookup('fixture-key');
+	await fetchStarted;
+	// Allow the response body reader to initialize before advancing the clock.
+	await new Promise((resolve) => setImmediate(resolve));
+	t.mock.timers.tick(599);
+	assert.equal(settled, false);
+	t.mock.timers.tick(1);
+	assert.equal((await pending).status, 504);
+	assert.equal(cancelled, true);
+	assert.equal(fetch.mock.callCount(), 1);
+});
