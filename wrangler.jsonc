@@ -1,5 +1,12 @@
 {
   "name": "gemini-proxy",
   "main": "src/index.js",
-  "compatibility_date": "2024-10-01"
+  "compatibility_date": "2024-10-01",
+  "vars": {
+    "PUBLIC_CHAT_ENABLED": "false",
+    "CHAT_MAX_OUTPUT_TOKENS": "4096",
+    "CHAT_UPSTREAM_TIMEOUT_MS": "55000"
+  }
+  // Required limiter bindings are proposed in README.md, not provisioned here.
+  // Enabling chat also requires OPENAI_API_KEY and approved PUBLIC_RESUME_CONTEXT.
 }
